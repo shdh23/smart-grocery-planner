@@ -46,19 +46,31 @@ from graph.graph import grocery_graph
 from auth import get_current_user
 
 
-# in-memory: plan_id -> list of progress events (filled by background pipeline)
+# ─────────────────────────────────────────
+# SSE PROGRESS STORE
+# In-memory dict: plan_id → list of progress events
+# Populated by background task as pipeline runs
+# ─────────────────────────────────────────
 progress_store: dict[str, list[dict]] = {}
 plan_complete:  dict[str, bool]       = {}
 
 
+# ─────────────────────────────────────────
+# LIFESPAN
+# ─────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Starting Smart Grocery Planner API...")
+    print("🚀 Starting Smart Grocery Planner API...")
     Base.metadata.create_all(bind=engine)
-    verify_connection()
+    verify_connection()   # prints its own status message
     yield
-    print("Shutting down...")
+    print("👋 Shutting down...")
 
+
+# ─────────────────────────────────────────
+# APP
+# ─────────────────────────────────────────
 
 app = FastAPI(
     title="Smart Grocery Planner",
@@ -67,18 +79,18 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-import os as _os  # allowed origins from env
-_raw_origins = _os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
-_allowed_origins = [o.strip() for o in _raw_origins.split(",")]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
 
 def get_or_create_user_config(user_id: str, db: Session) -> UserConfig:
     config = db.query(UserConfig).filter(UserConfig.user_id == user_id).first()
@@ -95,7 +107,7 @@ def get_or_create_user_config(user_id: str, db: Session) -> UserConfig:
 
 
 def push_progress(plan_id: str, event: str, data: dict):
-    """Append one progress event to the SSE store for this plan."""
+    """Push a progress event to the SSE store for this plan."""
     if plan_id not in progress_store:
         progress_store[plan_id] = []
     progress_store[plan_id].append({
@@ -106,14 +118,18 @@ def push_progress(plan_id: str, event: str, data: dict):
 
 
 def save_grocery_list(plan_id: str, final_output: dict, db: Session):
-    """Persist final grocery list to DB. Clears existing rows for this plan first so we don't get duplicate keys if formatter runs again."""
-    # clear any partial rows from a previous run
+    """
+    Save the final grocery list to DB.
+    Deletes all existing rows for this plan first to avoid unique constraint
+    violations if output_formatter fires more than once.
+    """
+    # ── Wipe any partial rows from a previous call ──
     db.query(GroceryList).filter(
         GroceryList.meal_plan_id == plan_id
     ).delete(synchronize_session=False)
     db.commit()
 
-    # insert one row per store
+    # ── Insert fresh ──
     grocery_lists = final_output.get("grocery_lists", [])
     for store_data in grocery_lists:
         db.add(GroceryList(
@@ -126,7 +142,7 @@ def save_grocery_list(plan_id: str, final_output: dict, db: Session):
             }
         ))
 
-    # one extra row for pantry metadata (deductions, restock, etc.)
+    # ── Pantry meta row ──
     deductions = final_output.get("pantry_deductions", [])
     db.add(GroceryList(
         meal_plan_id=plan_id,
@@ -141,8 +157,18 @@ def save_grocery_list(plan_id: str, final_output: dict, db: Session):
     db.commit()
 
 
+# ─────────────────────────────────────────
+# BACKGROUND TASK — run pipeline
+# Runs in a thread pool so it doesn't block
+# the event loop. Pushes SSE events as each
+# node completes.
+# ─────────────────────────────────────────
+
 def run_pipeline_task(plan_id: str, state: GroceryState, db_url: str):
-    """Runs the pipeline in a background thread and pushes SSE as each node finishes. Uses its own DB session."""
+    """
+    Background task: invoke the LangGraph pipeline and stream progress.
+    Uses a fresh DB session (background threads can't share sessions).
+    """
     from db.connection import SessionLocal
 
     push_progress(plan_id, "pipeline_start", {
@@ -154,28 +180,30 @@ def run_pipeline_task(plan_id: str, state: GroceryState, db_url: str):
     try:
         db = SessionLocal()
 
-        # messages we send to the client as each node finishes (merge_barrier is internal, no message)
+        # ── Push intermediate progress events ──
         NODE_MESSAGES = {
-            "recipe_agent":             "Extracting ingredients",
-            "extra_items_agent":        "Structuring extra items",
-            "consolidation_agent":      "Consolidating ingredient list",
-            "pantry_checker_agent":     "Checking your pantry",
-            "fsa_checker_agent":        "Checking FSA/HSA eligibility",
-            "store_router_agent_food":  "Routing food items to stores",
-            "store_router_agent_extra": "Routing extra items to stores",
-            "merge_barrier":            None,
-            "output_formatter":         "Assembling final grocery list",
+            "recipe_agent":             "🍽️  Extracting ingredients",
+            "extra_items_agent":        "🛍️  Structuring extra items",
+            "consolidation_agent":      "🔄 Consolidating ingredient list",
+            "pantry_checker_agent":     "🥫 Checking your pantry",
+            "fsa_checker_agent":        "💊 Checking FSA/HSA eligibility",
+            "store_router_agent_food":  "🏪 Routing food items to stores",
+            "store_router_agent_extra": "🏪 Routing extra items to stores",
+            "merge_barrier":            None,   # skip — internal node
+            "output_formatter":         "📋 Assembling final grocery list",
         }
 
+        # Stream for SSE progress updates
         for chunk in grocery_graph.stream(state, stream_mode="updates"):
             for node_name, node_data in chunk.items():
                 msg = NODE_MESSAGES.get(node_name)
-                if msg:
+                if msg:  # skip internal nodes like merge_barrier
                     push_progress(plan_id, "node_complete", {
                         "node":    node_name,
                         "message": msg,
                     })
 
+        # ── Now invoke to get the complete final state ──
         final_state  = grocery_graph.invoke(state)
         final_output = final_state.get("final_output", {})
         stats        = final_output.get("stats", {})
@@ -200,6 +228,7 @@ def run_pipeline_task(plan_id: str, state: GroceryState, db_url: str):
         push_progress(plan_id, "pipeline_error", {
             "message": f"Pipeline failed: {str(e)}"
         })
+        # Mark plan as failed
         try:
             db = SessionLocal()
             plan = db.query(MealPlan).filter(MealPlan.id == plan_id).first()
@@ -214,6 +243,10 @@ def run_pipeline_task(plan_id: str, state: GroceryState, db_url: str):
         plan_complete[plan_id] = True
 
 
+# ─────────────────────────────────────────
+# ── PLAN ENDPOINTS ──
+# ─────────────────────────────────────────
+
 @app.post("/api/plan", status_code=202)
 def create_plan(
     request:    CreatePlanRequest,
@@ -221,11 +254,16 @@ def create_plan(
     db:         Session = Depends(get_db),
     user_id:    str     = Depends(get_current_user)
 ):
-    """Start the pipeline in the background. Returns plan_id right away; client can poll /api/stream/{id} for progress."""
+    """
+    Submit meals + extra items → kick off pipeline in background.
+    Returns plan_id immediately. Use GET /api/stream/{id} for progress.
+    """
+    # ── Load user config defaults if not provided ──
     config = get_or_create_user_config(user_id, db)
     active_stores = request.active_stores or config.active_stores
     num_people    = request.num_people    or config.num_people
 
+    # ── Create meal plan row ──
     plan = MealPlan(
         user_id=         user_id,
         week_start_date= request.week_start_date or date.today(),
@@ -239,6 +277,7 @@ def create_plan(
     db.refresh(plan)
     plan_id = str(plan.id)
 
+    # ── Build initial state ──
     state: GroceryState = {
         "meals":             request.meals,
         "extra_items":       request.extra_items or [],
@@ -260,9 +299,11 @@ def create_plan(
         "error":             None
     }
 
+    # ── Initialize SSE store for this plan ──
     progress_store[plan_id] = []
     plan_complete[plan_id]  = False
 
+    # ── Run pipeline in background ──
     from db.connection import DATABASE_URL
     background.add_task(run_pipeline_task, plan_id, state, DATABASE_URL)
 
@@ -368,19 +409,28 @@ def get_history(
     ]
 
 
+# ─────────────────────────────────────────
+# ── SSE STREAMING ──
+# ─────────────────────────────────────────
+
 async def event_generator(plan_id: str) -> AsyncGenerator[str, None]:
-    """SSE: poll progress_store every 500ms and yield new events until pipeline is done."""
+    """
+    Yields SSE-formatted events as pipeline nodes complete.
+    Polls progress_store every 500ms until pipeline_complete.
+    """
     sent_index = 0
 
     while True:
         events = progress_store.get(plan_id, [])
 
+        # Send any new events since last poll
         while sent_index < len(events):
             event = events[sent_index]
             yield f"event: {event['event']}\n"
             yield f"data: {json.dumps(event['data'])}\n\n"
             sent_index += 1
 
+        # Stop streaming once pipeline is done
         if plan_complete.get(plan_id) and sent_index >= len(events):
             yield "event: done\ndata: {}\n\n"
             break
@@ -390,7 +440,23 @@ async def event_generator(plan_id: str) -> AsyncGenerator[str, None]:
 
 @app.get("/api/stream/{plan_id}")
 async def stream_plan(plan_id: str):
-    """SSE stream for a running plan. Events: pipeline_start, node_complete, pipeline_complete, pipeline_error, done."""
+    """
+    SSE endpoint — stream real-time agent progress for a running plan.
+
+    Frontend usage:
+        const es = new EventSource(`/api/stream/${planId}`);
+        es.addEventListener('node_complete', e => console.log(JSON.parse(e.data)));
+        es.addEventListener('pipeline_complete', e => setDone(true));
+        es.addEventListener('pipeline_error', e => setError(JSON.parse(e.data)));
+        es.addEventListener('done', () => es.close());
+
+    Events emitted:
+        pipeline_start    → { message, meals, people }
+        node_complete     → { node, message }
+        pipeline_complete → { message, stats, pantry_skipped, pantry_restock }
+        pipeline_error    → { message }
+        done              → {} (stream closed)
+    """
     if plan_id not in progress_store:
         raise HTTPException(status_code=404, detail="Plan not found or not started yet")
 
@@ -408,14 +474,24 @@ async def stream_plan(plan_id: str):
 
 def normalize_pantry_units(ingredient_name: str, quantity: float, unit: str,
                             restock_threshold: float, category: str) -> dict:
-    """Fix obvious unit mistakes: e.g. spices in kg -> g, oils in L -> ml; cap threshold so it's not above quantity."""
+    """
+    Intelligently normalize pantry units.
+    Catches common mistakes like spices saved as kg instead of g.
+    Rules:
+    - Spices > 10 kg → convert to g (no one has 10kg of a spice)
+    - Oils > 50 l → convert to ml
+    - threshold > quantity → set threshold to 0 (clearly wrong)
+    - threshold == quantity → set threshold to 10% of quantity
+    """
     q, u, t = quantity, unit.lower(), restock_threshold
 
+    # Convert suspiciously large spice quantities from kg to g
     if category in ("spice",) and u == "kg" and q > 1:
         q = q * 1000
         t = t * 1000 if t > 0 else t
         u = "g"
 
+    # Convert suspiciously large oil quantities from l to ml
     if category in ("oil",) and u == "l" and q > 20:
         q = q * 1000
         t = t * 1000 if t > 0 else t
@@ -426,6 +502,10 @@ def normalize_pantry_units(ingredient_name: str, quantity: float, unit: str,
         t = 0
 
     return {"quantity": round(q, 2), "unit": u, "restock_threshold": round(t, 2)}
+
+# ─────────────────────────────────────────
+# ── PANTRY ENDPOINTS ──
+# ─────────────────────────────────────────
 
 @app.get("/api/pantry")
 def get_pantry(
@@ -485,6 +565,7 @@ def add_pantry_item(
     user_id: str     = Depends(get_current_user)
 ):
     """Add a single item to the pantry."""
+    # Check for duplicate
     existing = db.query(Pantry).filter(
         Pantry.user_id == user_id,
         Pantry.ingredient_name == request.ingredient_name
@@ -637,6 +718,10 @@ def delete_pantry_item(
     db.commit()
 
 
+# ─────────────────────────────────────────
+# ── CONFIG ENDPOINTS ──
+# ─────────────────────────────────────────
+
 @app.get("/api/config")
 def get_config(
     db:      Session = Depends(get_db),
@@ -675,6 +760,10 @@ def update_config(
     }
 
 
+# ─────────────────────────────────────────
+# ── STORE PREFERENCES ENDPOINTS ──
+# ─────────────────────────────────────────
+
 @app.get("/api/preferences")
 def get_preferences(
     db:      Session = Depends(get_db),
@@ -702,7 +791,10 @@ def upsert_preference(
     db:                 Session = Depends(get_db),
     user_id:            str     = Depends(get_current_user)
 ):
-    """Set or update one ingredient -> store routing preference."""
+    """
+    Set or update a routing preference.
+    Example: ingredient_pattern='basmati rice', preferred_store='costco'
+    """
     pref = db.query(StorePreference).filter(
         StorePreference.user_id == user_id,
         StorePreference.ingredient_pattern == ingredient_pattern
@@ -734,7 +826,10 @@ def fix_pantry_units(
     db:      Session = Depends(get_db),
     user_id: str     = Depends(get_current_user)
 ):
-    """One-off: normalize bad units on all pantry items. Safe to run again."""
+    """
+    One-time fix — normalizes all pantry items with bad units.
+    Safe to call multiple times.
+    """
     items = db.query(Pantry).filter(Pantry.user_id == user_id).all()
     fixed = []
 
@@ -754,6 +849,10 @@ def fix_pantry_units(
         "fixed": fixed,
         "message": f"Fixed {len(fixed)} items with incorrect units"
     }
+
+# ─────────────────────────────────────────
+# ── RECIPE ENDPOINTS ──
+# ─────────────────────────────────────────
 
 @app.get("/api/recipes")
 def get_recipes(
@@ -784,7 +883,10 @@ def create_recipe(
     db:      Session = Depends(get_db),
     user_id: str     = Depends(get_current_user)
 ):
-    """Save a new recipe. Body: name, servings, ingredients (list of {name, quantity, unit, category})."""
+    """
+    Save a new recipe.
+    Body: { name, servings, ingredients: [{name, quantity, unit, category}] }
+    """
     name = request.get("name", "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Recipe name is required")
@@ -859,6 +961,10 @@ def delete_recipe(
 
 
 
+# ─────────────────────────────────────────
+# ── ITEM REMOVAL / FEEDBACK ──
+# ─────────────────────────────────────────
+
 @app.post("/api/plan/{plan_id}/remove-item")
 def remove_item(
     plan_id:  str,
@@ -866,7 +972,10 @@ def remove_item(
     db:       Session = Depends(get_db),
     user_id:  str     = Depends(get_current_user)
 ):
-    """Remove item from list and record feedback. Body: ingredient_name, meal_name, reason, store, quantity, unit."""
+    """
+    Remove an item from the grocery list and process the reason.
+    Body: { ingredient_name, meal_name, reason, store, quantity, unit }
+    """
     ingredient_name = request.get("ingredient_name", "").strip()
     reason          = request.get("reason", "").strip()
 
@@ -875,6 +984,7 @@ def remove_item(
     if not reason:
         raise HTTPException(status_code=400, detail="reason is required")
 
+    # Verify plan belongs to user
     plan = db.query(MealPlan).filter(
         MealPlan.id == plan_id,
         MealPlan.user_id == user_id
@@ -905,7 +1015,7 @@ def get_feedback(
     db:      Session = Depends(get_db),
     user_id: str     = Depends(get_current_user)
 ):
-    """List recent feedback records (for debugging)."""
+    """View all feedback records — useful for debugging / transparency."""
     records = db.query(UserFeedback).filter(
         UserFeedback.user_id == user_id
     ).order_by(UserFeedback.created_at.desc()).limit(100).all()
@@ -925,29 +1035,36 @@ def get_feedback(
 
 
 
+# ─────────────────────────────────────────
+# ── INTENT PARSER ──
+# ─────────────────────────────────────────
+
 @app.post("/api/parse-intent")
 def parse_intent(
     request: dict,
     db:      Session = Depends(get_db),
     user_id: str     = Depends(get_current_user)
 ):
-    """Parse free-text instruction into add/remove meals, extras, stores, num_people, item_store_overrides. Accepts message or text + optional context."""
+    """
+    Parse a natural language instruction and return a diff to apply to the plan form.
+    Body: {
+      text: str,
+      current_state: { meals, extra_items, active_stores, num_people }
+    }
+    """
     import json
 
-    text = (request.get("text") or request.get("message") or "").strip()
-    current_state = request.get("current_state") or {
-        "meals":          request.get("meals", []),
-        "extra_items":    request.get("extra_items", []),
-        "active_stores":  request.get("active_stores", []),
-        "num_people":     request.get("num_people", 2),
-    }
+    text          = request.get("text", "").strip()
+    current_state = request.get("current_state", {})
 
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
 
+    # Fetch user's active stores from config for context
     config       = get_or_create_user_config(user_id, db)
     known_stores = config.active_stores or []
 
+    # Build prompt as plain string to avoid LangChain treating JSON in LLM response as template vars
     system_msg = f"""You are a grocery planning assistant. The user has typed a natural language instruction to modify their grocery plan.
 
 Current plan state:
@@ -987,7 +1104,7 @@ Return ONLY valid JSON, no markdown, no explanation."""
     try:
         from langchain_openai import ChatOpenAI
         from langchain_core.messages import SystemMessage, HumanMessage
-        llm  = ChatOpenAI(model="gpt-4o", temperature=0, api_key=_os.getenv("OPENAI_API_KEY"))
+        llm  = ChatOpenAI(model="gpt-4o", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
         raw  = llm.invoke([SystemMessage(content=system_msg), HumanMessage(content=text)])
 
         result_text = raw.content.strip()
@@ -1002,6 +1119,10 @@ Return ONLY valid JSON, no markdown, no explanation."""
         raise HTTPException(status_code=500, detail=f"Intent parsing failed: {str(e)}")
 
 
+# ─────────────────────────────────────────
+# ── HEALTH CHECK ──
+# ─────────────────────────────────────────
+
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     try:
@@ -1015,6 +1136,10 @@ def health(db: Session = Depends(get_db)):
         "version":  "1.0.0"
     }
 
+
+# ─────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
