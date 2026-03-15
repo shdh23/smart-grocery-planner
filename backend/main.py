@@ -22,6 +22,7 @@ Endpoints:
 
 import asyncio
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -1061,8 +1062,13 @@ def parse_intent(
     """
     import json
 
-    text          = request.get("text", "").strip()
-    current_state = request.get("current_state", {})
+    text = (request.get("text") or request.get("message") or "").strip()
+    current_state = request.get("current_state") or {
+        "meals":          request.get("meals", []),
+        "extra_items":    request.get("extra_items", []),
+        "active_stores":  request.get("active_stores", []),
+        "num_people":     request.get("num_people", 2),
+    }
 
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
