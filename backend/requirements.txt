@@ -1,0 +1,33 @@
+# Smart Grocery Planner — Backend dependencies
+# Use a venv: python -m venv venv  then  venv\Scripts\activate  then  pip install -r requirements.txt
+
+# Web & API
+fastapi>=0.109.0,<0.115.0
+uvicorn[standard]>=0.27.0,<0.32.0
+sse-starlette>=1.8.0,<2.0.0
+
+# LangChain & LangGraph
+langchain>=0.1.0,<0.3.0
+langchain-openai>=0.0.5,<0.2.0
+langchain-community>=0.0.20,<0.3.0
+langgraph>=0.2.0,<0.3.0          # 0.2.0+ required for multiple START edges (parallel flows)
+
+# Structured output & validation
+pydantic>=2.5.0,<2.10.0
+
+# Database
+sqlalchemy>=2.0.25,<2.1.0
+psycopg2-binary>=2.9.9,<2.10.0
+alembic>=1.13.0,<1.14.0
+
+# Vector store (FSA/HSA RAG)
+chromadb>=0.4.22,<0.5.0
+
+# Config & env
+python-dotenv>=1.0.0,<1.1.0
+
+# HTTP client (for LLM APIs)
+httpx>=0.26.0,<0.28.0
+
+# Web search (store inventory + FSA/HSA lookup)
+tavily-python>=0.3.0,<0.4.0
