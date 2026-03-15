@@ -9,15 +9,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set in .env")
 
-# Render and other cloud Postgres need postgresql:// and often SSL
-_url = DATABASE_URL.strip()
-if _url.startswith("postgres://"):
-    _url = "postgresql://" + _url[11:]
-if "render.com" in _url and "sslmode=" not in _url:
-    _url += "?sslmode=require" if "?" not in _url else "&sslmode=require"
-
 engine = create_engine(
-    _url,
+    DATABASE_URL,
     pool_pre_ping=True,
     pool_size=5,
     echo=False
