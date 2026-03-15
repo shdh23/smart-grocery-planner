@@ -3,7 +3,7 @@ import { AuthProvider, useAuth } from './auth/AuthContext';
 import MealPlanner   from './screens/MealPlanner';
 import AgentProgress from './screens/AgentProgress';
 import GroceryList   from './screens/GroceryList';
-import History       from './screens/history';
+import History       from './screens/History';
 import Recipes       from './screens/Recipes';
 import Settings      from './screens/Settings';
 import Login         from './screens/Login';
