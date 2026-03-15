@@ -32,3 +32,5 @@ httpx>=0.26.0,<0.28.0
 
 # Web search (store inventory + FSA/HSA lookup)
 tavily-python>=0.3.0,<0.4.0
+
+python-jose[cryptography]>=3.3.0
