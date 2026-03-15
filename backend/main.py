@@ -29,8 +29,9 @@ from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from db.connection import engine, get_db, verify_connection
 from db.models import Base, MealPlan, GroceryList, StorePreference, UserConfig, Pantry, Recipe, UserFeedback
@@ -86,6 +87,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+def root():
+    """Redirect to API docs so the backend URL is not a 404."""
+    return RedirectResponse(url="/docs", status_code=302)
 
 
 # ─────────────────────────────────────────
@@ -1126,9 +1133,9 @@ Return ONLY valid JSON, no markdown, no explanation."""
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     try:
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         db_ok = True
-    except:
+    except Exception:
         db_ok = False
     return {
         "status":   "ok" if db_ok else "degraded",
