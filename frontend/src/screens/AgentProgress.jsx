@@ -22,7 +22,8 @@ export default function AgentProgress() {
   const [stats,    setStats]    = useState(null);
 
   useEffect(() => {
-    const es = new EventSource(`http://localhost:8000/api/stream/${planId}`);
+    const baseURL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+    const es = new EventSource(`${baseURL}/api/stream/${planId}`);
 
     es.addEventListener('pipeline_start', e => {
       const d = JSON.parse(e.data);
