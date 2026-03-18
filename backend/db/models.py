@@ -14,6 +14,7 @@ class UserConfig(Base):
     num_people    = Column(Integer, nullable=False, default=1)
     updated_at    = Column(TIMESTAMP(timezone=True), server_default=func.now(),
                            onupdate=func.now())
+    onboarding_complete = Column(Boolean, nullable=False, server_default='false')
 
 class MealPlan(Base):
     __tablename__ = "meal_plans"

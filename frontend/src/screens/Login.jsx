@@ -47,7 +47,7 @@ export default function Login() {
         <div style={{ textAlign: 'center', marginBottom: 40 }}>
           <div style={{ fontSize: '2.5rem', marginBottom: 8 }}>🛒</div>
           <h1 style={{ fontSize: '1.8rem', marginBottom: 4 }}>Grocery Planner</h1>
-          <p style={{ color: 'var(--muted)', fontSize: '0.88rem' }}>AI-powered · Pantry-aware · FSA-smart</p>
+          <p style={{ color: 'var(--muted)', fontSize: '0.88rem' }}>Pantry-aware · FSA-smart</p>
         </div>
 
         <div className="card">

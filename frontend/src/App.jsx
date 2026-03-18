@@ -1,12 +1,14 @@
+import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate, NavLink } from 'react-router-dom';
 import { AuthProvider, useAuth } from './auth/AuthContext';
-import MealPlanner   from './screens/MealPlanner';
+import PlannerChat   from './screens/PlannerChat';
 import AgentProgress from './screens/AgentProgress';
 import GroceryList   from './screens/GroceryList';
 import History       from './screens/History';
 import Recipes       from './screens/Recipes';
 import Settings      from './screens/Settings';
 import Login         from './screens/Login';
+import Onboarding    from './screens/Onboarding';
 import './index.css';
 
 function ProtectedRoute({ children }) {
@@ -35,7 +37,7 @@ function Header() {
         <span style={{ fontSize: '1.4rem' }}>🛒</span>
         <div>
           <h1>Grocery Planner</h1>
-          <p className="tagline">AI-powered · Pantry-aware · FSA-smart</p>
+          <p className="tagline">Pantry-aware · FSA-smart</p>
         </div>
       </div>
       {user && (
@@ -68,25 +70,49 @@ function AppRoutes() {
   if (loading) return <div className="page"><div className="empty-state"><div className="spinner" /></div></div>;
 
   return (
-    <Routes>
-      <Route path="/login" element={user ? <Navigate to="/" replace /> : <Login />} />
-      <Route path="/" element={<ProtectedRoute><MealPlanner /></ProtectedRoute>} />
-      <Route path="/progress/:planId" element={<ProtectedRoute><AgentProgress /></ProtectedRoute>} />
-      <Route path="/list/:planId"     element={<ProtectedRoute><GroceryList /></ProtectedRoute>} />
-      <Route path="/history"          element={<ProtectedRoute><History /></ProtectedRoute>} />
-      <Route path="/settings"         element={<ProtectedRoute><Settings /></ProtectedRoute>} />
-      <Route path="*"                 element={<Navigate to="/" replace />} />
-    </Routes>
+    <>
+      <Routes>
+        <Route path="/login" element={user ? <Navigate to="/" replace /> : <Login />} />
+        <Route path="/" element={<ProtectedRoute><PlannerChat /></ProtectedRoute>} />
+        <Route path="/progress/:planId" element={<ProtectedRoute><AgentProgress /></ProtectedRoute>} />
+        <Route path="/list/:planId"     element={<ProtectedRoute><GroceryList /></ProtectedRoute>} />
+        <Route path="/history"          element={<ProtectedRoute><History /></ProtectedRoute>} />
+        <Route path="/recipes"          element={<ProtectedRoute><Recipes /></ProtectedRoute>} />
+        <Route path="/settings"         element={<ProtectedRoute><Settings /></ProtectedRoute>} />
+        <Route path="*"                 element={<Navigate to="/" replace />} />
+      </Routes>
+    </>
   );
+}
+
+function OnboardingGate() {
+  const { user } = useAuth();
+  const [showOnboarding,    setShowOnboarding]    = React.useState(false);
+  const [onboardingChecked, setOnboardingChecked] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!user) { setOnboardingChecked(true); return; }
+    import('./api/client').then(({ getConfig }) => {
+      getConfig().then(({ data }) => {
+        if (!data.onboarding_complete) setShowOnboarding(true);
+        setOnboardingChecked(true);
+      }).catch(() => setOnboardingChecked(true));
+    });
+  }, [user]);
+
+  if (!onboardingChecked) return null;
+  if (!showOnboarding)    return null;
+  return <Onboarding onComplete={() => setShowOnboarding(false)} />;
 }
 
 export default function App() {
   return (
     <AuthProvider>
       <BrowserRouter>
-        <div className="app-shell">
+        <div className="app-shell" style={{ position: 'relative' }}>
           <Header />
           <AppRoutes />
+          <OnboardingGate />
         </div>
       </BrowserRouter>
     </AuthProvider>

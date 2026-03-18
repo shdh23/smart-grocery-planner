@@ -8,6 +8,25 @@ from db.models import Pantry, MealPlan, GroceryList
 from datetime import datetime, timezone
 import json
 
+# Convert quantity to base units (g or ml) for comparison with threshold
+_UNIT_TO_BASE = {
+    "g": 1, "kg": 1000, "mg": 0.001,
+    "ml": 1, "l": 1000,
+    "tsp": 5, "tbsp": 15, "cup": 240, "cups": 240,
+    "pieces": 1, "piece": 1,
+}
+
+
+def _quantity_below_threshold(pantry_item: Pantry) -> bool:
+    """True if quantity (after deduction) is at or below restock threshold. Unit-aware."""
+    if getattr(pantry_item, "restock_threshold", 0) <= 0:
+        return False
+    qty_unit = (pantry_item.unit or "g").lower().strip()
+    thr_unit = (getattr(pantry_item, "restock_threshold_unit", None) or pantry_item.unit or "g").lower().strip()
+    qty_base = pantry_item.quantity * _UNIT_TO_BASE.get(qty_unit, 1)
+    thr_base = pantry_item.restock_threshold * _UNIT_TO_BASE.get(thr_unit, 1)
+    return qty_base <= thr_base
+
 
 def apply_pantry_deductions(
     plan_id: str,
@@ -79,7 +98,7 @@ def apply_pantry_deductions(
             "unit":      pantry_item.unit
         })
 
-        if pantry_item.quantity <= pantry_item.restock_threshold:
+        if _quantity_below_threshold(pantry_item):
             restock_alerts.append({
                 "name":            ingredient_name,
                 "quantity":        pantry_item.quantity,
@@ -87,7 +106,7 @@ def apply_pantry_deductions(
                 "threshold":       pantry_item.restock_threshold,
                 "preferred_store": pantry_item.preferred_store,
                 "message":         (
-                    f"Only {pantry_item.quantity}{pantry_item.unit} left — "
+                    f"Only {pantry_item.quantity} {pantry_item.unit} left — "
                     f"restock from {pantry_item.preferred_store or 'your preferred store'}"
                 )
             })

@@ -23,6 +23,7 @@ Endpoints:
 import asyncio
 import json
 import os
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -30,9 +31,8 @@ from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
 from db.connection import engine, get_db, verify_connection
 from db.models import Base, MealPlan, GroceryList, StorePreference, UserConfig, Pantry, Recipe, UserFeedback
@@ -56,6 +56,10 @@ from auth import get_current_user
 progress_store: dict[str, list[dict]] = {}
 plan_complete:  dict[str, bool]       = {}
 
+
+
+from fastapi import Request
+from fastapi.responses import Response
 
 # ─────────────────────────────────────────
 # LIFESPAN
@@ -86,14 +90,21 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "Authorization", "Content-Type"],
+    expose_headers=["*"],
 )
 
 
-@app.get("/")
-def root():
-    """Redirect to API docs so the backend URL is not a 404."""
-    return RedirectResponse(url="/docs", status_code=302)
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str, request: Request):
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin":  "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept",
+        }
+    )
 
 
 # ─────────────────────────────────────────
@@ -741,7 +752,8 @@ def get_config(
         "user_id":       config.user_id,
         "active_stores": config.active_stores,
         "num_people":    config.num_people,
-        "updated_at":    config.updated_at.isoformat() if config.updated_at else None
+        "updated_at":    config.updated_at.isoformat() if config.updated_at else None,
+        "onboarding_complete": config.onboarding_complete
     }
 
 
@@ -757,6 +769,8 @@ def update_config(
     if request.active_stores is not None: config.active_stores = request.active_stores
     if request.num_people    is not None: config.num_people    = request.num_people
     config.updated_at = datetime.now(timezone.utc)
+    if request.onboarding_complete is not None:
+        config.onboarding_complete = request.onboarding_complete
 
     db.commit()
 
@@ -1054,99 +1068,280 @@ def parse_intent(
     user_id: str     = Depends(get_current_user)
 ):
     """
-    Parse a natural language instruction and return a diff to apply to the plan form.
+    Tool-calling agent for conversational plan building.
     Body: {
-      text: str,
-      current_state: { meals, extra_items, active_stores, num_people }
+      message: str,
+      current_state: { meals, extra_items, active_stores, num_people },
+      conversation_history: [{ role, content }]
+    }
+    Returns: {
+      state: updated plan state,
+      actions: list of tools called,
+      status: "clarifying" | "confirming" | "ready" | "out_of_scope",
+      message: str
     }
     """
     import json
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+    from langchain_core.tools import tool
+    from langchain.agents import create_tool_calling_agent, AgentExecutor
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-    text = (request.get("text") or request.get("message") or "").strip()
-    current_state = request.get("current_state") or {
-        "meals":          request.get("meals", []),
-        "extra_items":    request.get("extra_items", []),
-        "active_stores":  request.get("active_stores", []),
-        "num_people":     request.get("num_people", 2),
-    }
+    message       = request.get("message", "").strip()
+    current_state = request.get("current_state", {})
+    history       = request.get("conversation_history", [])
 
-    if not text:
-        raise HTTPException(status_code=400, detail="text is required")
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
 
-    # Fetch user's active stores from config for context
     config       = get_or_create_user_config(user_id, db)
-    known_stores = config.active_stores or []
+    known_stores = config.active_stores or ["trader_joes", "costco", "indian_store", "target"]
 
-    # Build prompt as plain string to avoid LangChain treating JSON in LLM response as template vars
-    system_msg = f"""You are a grocery planning assistant. The user has typed a natural language instruction to modify their grocery plan.
+    # ── Mutable plan state the tools will modify ──
+    plan = {
+        "meals":         list(current_state.get("meals", [])),
+        "extra_items":   list(current_state.get("extra_items", [])),
+        "active_stores": list(current_state.get("active_stores", known_stores)),
+        "num_people":    current_state.get("num_people"),
+        "meal_hints":    list(current_state.get("meal_hints", [])),
+        "preferences":   list(current_state.get("preferences", [])),
+    }
+    actions  = []
+    status   = ["clarifying"]
 
-Current plan state:
-- Meals: {json.dumps(current_state.get("meals", []))}
-- Extra items: {json.dumps(current_state.get("extra_items", []))}
-- Active stores: {json.dumps(current_state.get("active_stores", []))}
-- Number of people: {current_state.get("num_people", 2)}
+    # ── Tools ──
+    @tool
+    def add_meal(name: str) -> str:
+        """Add a meal to the plan. Fix any typos and use proper capitalisation."""
+        clean = name.strip().title()
+        if clean not in plan["meals"]:
+            plan["meals"].append(clean)
+            actions.append(f"Added meal: {clean}")
+        return f"Added {clean}"
 
-User's known stores: {json.dumps(known_stores)}
+    @tool
+    def remove_meal(name: str) -> str:
+        """Remove a meal from the plan."""
+        plan["meals"] = [m for m in plan["meals"] if m.lower() != name.lower()]
+        actions.append(f"Removed meal: {name}")
+        return f"Removed {name}"
 
-Parse the instruction and return ONLY a valid JSON object with these optional keys:
-  add_meals: list of clean meal names to add (no hints, just the name)
-  remove_meals: list of meal names to remove
-  add_extras: list of extra items to add
-  remove_extras: list of extra items to remove
-  add_stores: list of store IDs to add (snake_case)
-  remove_stores: list of store IDs to remove
-  set_num_people: integer or omit
-  meal_hints: list of objects, one per meal that has buying instructions:
-    meal: clean meal name
-    ingredients: list of items to actually buy
-    store: snake_case store ID where to buy them
-    suggest_save_recipe: true
-  summary: short human-readable summary of changes
+    @tool
+    def set_people(count: int) -> str:
+        """Set the number of people to cook for."""
+        plan["num_people"] = count
+        actions.append(f"Set people: {count}")
+        return f"Set to {count} people"
 
-MEAL HINT RULES:
-- "Idli - I get batter from Idli Express" → add_meals: ["Idli"], meal_hints: [meal: "Idli", ingredients: ["idli batter"], store: "idli_express"]
-- "Pasta (use store-bought sauce from Trader Joes)" → hint with ingredients: ["pasta sauce"], store: "trader_joes"
-- Always add new store to add_stores as well
+    @tool
+    def add_extra_item(name: str) -> str:
+        """Add a non-food extra item (medicine, supplement, household)."""
+        clean = name.strip()
+        if clean not in plan["extra_items"]:
+            plan["extra_items"].append(clean)
+            actions.append(f"Added extra: {clean}")
+        return f"Added {clean} to extras"
 
-STORE ID RULES:
-- Normalize to snake_case: "Idli Express" → "idli_express", "Whole Foods" → "whole_foods"
-- If store exists in known_stores use exact ID
+    @tool
+    def remove_extra_item(name: str) -> str:
+        """Remove an extra item from the plan."""
+        plan["extra_items"] = [x for x in plan["extra_items"] if x.lower() != name.lower()]
+        actions.append(f"Removed extra: {name}")
+        return f"Removed {name}"
 
-Return ONLY valid JSON, no markdown, no explanation."""
+    @tool
+    def add_store(store_name: str) -> str:
+        """Add a store to the active stores list. Normalise name to snake_case."""
+        store_id = store_name.lower().strip().replace(" ", "_").replace("'", "")
+        if store_id not in plan["active_stores"]:
+            plan["active_stores"].append(store_id)
+            actions.append(f"Added store: {store_id}")
+            # Also save to user preferences in DB
+            try:
+                existing = db.query(StorePreference).filter(
+                    StorePreference.user_id == user_id,
+                    StorePreference.ingredient_pattern == store_id
+                ).first()
+                if not existing:
+                    config.active_stores = plan["active_stores"]
+                    db.commit()
+            except:
+                pass
+        return f"Added store: {store_id}"
+
+    @tool
+    def remove_store(store_name: str) -> str:
+        """Remove a store from the active stores list."""
+        store_id = store_name.lower().strip().replace(" ", "_").replace("'", "")
+        plan["active_stores"] = [s for s in plan["active_stores"] if s != store_id]
+        actions.append(f"Removed store: {store_id}")
+        return f"Removed {store_id}"
+
+    @tool
+    def update_pantry(ingredient: str, quantity: float, unit: str) -> str:
+        """Add or update a pantry item. Use when user says they already have something."""
+        try:
+            existing = db.query(Pantry).filter(
+                Pantry.user_id == user_id,
+                Pantry.ingredient_name.ilike(ingredient)
+            ).first()
+            if existing:
+                existing.quantity += quantity
+            else:
+                db.add(Pantry(
+                    user_id=user_id,
+                    ingredient_name=ingredient.lower(),
+                    quantity=quantity,
+                    unit=unit,
+                    category="other",
+                    restock_threshold=0
+                ))
+            db.commit()
+            actions.append(f"Updated pantry: {ingredient} {quantity}{unit}")
+            return f"Added {ingredient} to pantry"
+        except Exception as e:
+            return f"Could not update pantry: {str(e)}"
+
+    @tool
+    def add_meal_hint(meal: str, ingredient: str, store: str) -> str:
+        """Use when user says they get a specific ingredient from a specific store for a meal.
+        e.g. 'I get idli batter from Idli Express'"""
+        store_id = store.lower().strip().replace(" ", "_").replace("'", "")
+        plan["meal_hints"].append({"meal": meal, "ingredient": ingredient, "store": store_id})
+        if store_id not in plan["active_stores"]:
+            plan["active_stores"].append(store_id)
+        actions.append(f"Meal hint: {meal} → {ingredient} from {store_id}")
+        return f"Noted — will get {ingredient} from {store_id} for {meal}"
+
+    @tool
+    def add_preference(preference: str) -> str:
+        """Add a cooking preference or dietary note. e.g. vegetarian, spicy, no onion."""
+        plan["preferences"].append(preference)
+        actions.append(f"Preference: {preference}")
+        return f"Noted: {preference}"
+
+    @tool
+    def confirm_plan() -> str:
+        """Call this when the user confirms they are happy with the plan and want to build the list."""
+        status[0] = "ready"
+        actions.append("User confirmed plan")
+        return "Plan confirmed — building list"
+
+    @tool
+    def out_of_scope(reason: str) -> str:
+        """Call this when the user asks for something completely unrelated to grocery planning."""
+        status[0] = "out_of_scope"
+        return reason
+
+    tools = [
+        add_meal, remove_meal, set_people,
+        add_extra_item, remove_extra_item,
+        add_store, remove_store,
+        update_pantry, add_meal_hint,
+        add_preference, confirm_plan, out_of_scope
+    ]
+
+    # ── System prompt ──
+    system = f"""You are a smart grocery planning assistant. Help the user build their weekly grocery plan through natural conversation.
+
+CURRENT PLAN:
+- Meals: {json.dumps(plan["meals"])}
+- Extras: {json.dumps(plan["extra_items"])}
+- Stores: {json.dumps(plan["active_stores"])}
+- People: {plan["num_people"]}
+- Preferences: {json.dumps(plan["preferences"])}
+
+USER'S SAVED STORES: {json.dumps(known_stores)}
+
+Use your tools to update the plan based on what the user says. You can call multiple tools in one turn.
+
+GUIDELINES:
+- Fix typos intelligently: "paner" → "Paneer", "butter chiken" → "Butter Chicken", "idly" → "Idli"
+- "I have all the spices" → call update_pantry for common spices with high quantity
+- "I already have chicken" → call update_pantry("chicken", 500, "g")
+- "get batter from Idli Express" → call add_meal_hint
+- "I'm vegetarian" → call add_preference("vegetarian")
+- "make it spicy" → call add_preference("spicy")
+- "same stores as usual" → use saved stores, no change needed
+- Out of scope (furniture, clothes, electronics) → call out_of_scope
+- After calling tools, determine if anything is still missing:
+  - No meals → ask what they want to cook
+  - No num_people → ask how many people
+  - Both set → move toward confirming
+- When user says "yes", "looks good", "go ahead", "build it" → call confirm_plan()
+
+After using tools, respond naturally and conversationally. Don't list the tools you called.
+"""
 
     try:
-        from langchain_openai import ChatOpenAI
-        from langchain_core.messages import SystemMessage, HumanMessage
-        llm  = ChatOpenAI(model="gpt-4o", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
-        raw  = llm.invoke([SystemMessage(content=system_msg), HumanMessage(content=text)])
+        llm    = ChatOpenAI(model="gpt-4o", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
 
-        result_text = raw.content.strip()
-        if result_text.startswith("```"):
-            result_text = result_text.split("```")[1]
-            if result_text.startswith("json"):
-                result_text = result_text[4:]
-        result = json.loads(result_text.strip())
-        return result
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder("agent_scratchpad"),
+        ])
+
+        agent         = create_tool_calling_agent(llm, tools, prompt)
+        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=False, max_iterations=5)
+
+        chat_history = []
+        for h in history:
+            if not isinstance(h, dict):
+                continue
+            role, content = h.get("role"), h.get("content") or ""
+            if role == "user":
+                chat_history.append(HumanMessage(content=content))
+            elif role == "assistant":
+                chat_history.append(AIMessage(content=content))
+
+        result = agent_executor.invoke({
+            "input":        message,
+            "chat_history": chat_history,
+        })
+
+        response_text = result.get("output", "")
+
+        # Determine status
+        if status[0] == "ready":
+            final_status = "ready"
+        elif status[0] == "out_of_scope":
+            final_status = "out_of_scope"
+        elif plan["meals"] and plan["num_people"]:
+            final_status = "confirming"
+        else:
+            final_status = "clarifying"
+
+        # Ensure stores default if empty
+        if not plan["active_stores"]:
+            plan["active_stores"] = known_stores
+
+        return {
+            "state":   plan,
+            "actions": actions,
+            "status":  final_status,
+            "message": response_text,
+        }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Intent parsing failed: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Agent failed: {str(e)}")
 
-
-# ─────────────────────────────────────────
-# ── HEALTH CHECK ──
-# ─────────────────────────────────────────
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     try:
+        from sqlalchemy import text
         db.execute(text("SELECT 1"))
         db_ok = True
-    except Exception:
+    except:
         db_ok = False
     return {
-        "status":   "ok" if db_ok else "degraded",
-        "db":       "connected" if db_ok else "disconnected",
-        "version":  "1.0.0"
+        "status":  "ok" if db_ok else "degraded",
+        "db":      "connected" if db_ok else "disconnected",
+        "version": "1.0.0"
     }
 
 

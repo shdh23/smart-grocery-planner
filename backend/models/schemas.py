@@ -10,6 +10,7 @@ class UserConfig(BaseModel):
     user_id:       str = "default_user"
     active_stores: list[str] = Field(default=DEFAULT_STORES, min_length=1)
     num_people:    int = Field(default=1, ge=1, le=20)
+    onboarding_complete: Optional[bool] = None
 
 class UpdateUserConfigRequest(BaseModel):
     active_stores: Optional[list[str]] = None
