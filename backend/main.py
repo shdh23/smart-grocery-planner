@@ -1260,16 +1260,30 @@ GUIDELINES:
 - Fix typos intelligently: "paner" → "Paneer", "butter chiken" → "Butter Chicken", "idly" → "Idli"
 - "I have all the spices" → call update_pantry for common spices with high quantity
 - "I already have chicken" → call update_pantry("chicken", 500, "g")
-- "get batter from Idli Express" → call add_meal_hint
 - "I'm vegetarian" → call add_preference("vegetarian")
 - "make it spicy" → call add_preference("spicy")
 - "same stores as usual" → use saved stores, no change needed
 - Out of scope (furniture, clothes, electronics) → call out_of_scope
-- After calling tools, determine if anything is still missing:
+- When user says "yes", "looks good", "go ahead", "build it" → call confirm_plan()
+
+MEAL HINT DETECTION — this is critical, always check for hints:
+When a meal name contains buying instructions (after a dash, in brackets, or as a separate sentence), you MUST:
+1. Call add_meal() with just the clean meal name
+2. ALSO call add_meal_hint() with the ingredient and store
+3. ALSO call add_store() if the store is new
+
+Examples:
+- "dosa - I get batter from Idli Express" → add_meal("Dosa") + add_meal_hint("Dosa", "dosa batter", "idli_express") + add_store("idli_express")
+- "Idli, I get batter from Idli Express" → add_meal("Idli") + add_meal_hint("Idli", "idli batter", "idli_express") + add_store("idli_express")
+- "Pasta (use store-bought sauce from Trader Joes)" → add_meal("Pasta") + add_meal_hint("Pasta", "pasta sauce", "trader_joes")
+- "I get dosa batter from Idli Express" (standalone) → add_meal_hint for most recently added meal
+
+ALWAYS scan every message for store/ingredient hints — they can appear inline with meal names or as separate sentences.
+
+After calling tools, determine if anything is still missing:
   - No meals → ask what they want to cook
   - No num_people → ask how many people
   - Both set → move toward confirming
-- When user says "yes", "looks good", "go ahead", "build it" → call confirm_plan()
 
 After using tools, respond naturally and conversationally. Don't list the tools you called.
 """

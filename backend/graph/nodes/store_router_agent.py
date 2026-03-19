@@ -42,7 +42,9 @@ You have access to a web search tool. Use it to verify whether a specific
 store carries a specific item when you are not confident.
 
 Routing rules:
-1. INGREDIENT NOTES OVERRIDE — if an ingredient has a note like "get from idly_express" or "from Trader Joes", ALWAYS route it to that store, even if it is not in the active stores list. Add the store to the routing automatically.
+1. MEAL HINTS OVERRIDE — check the meal_hints in the request. If an ingredient matches a meal hint (e.g. "dosa batter" for "Dosa" → "idli_express"), ALWAYS route it to that store regardless of anything else.
+   Also check ingredient notes — if a note says "get from X" or "from X store", route to that store.
+   Never override a meal hint with your own judgment.
 2. AVAILABILITY FIRST — only assign a store if it actually carries the item. Search if unsure.
 3. Best store priority:
    - Indian store → Indian/South Asian ingredients
